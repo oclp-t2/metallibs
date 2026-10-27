@@ -1,0 +1,180 @@
+name: CI - Security Scan
+
+# Scans the Metallibs API site for security problems every day and fixes
+# what can be fixed automatically.
+#
+# - site: .github/scripts/site_security.py checks the HTML pages
+#   (Content-Security-Policy, no-referrer, https-only links, noopener) and
+#   repairs them, and checks MetallibSupportPkg/manifest.json (https URLs on
+#   github.com, valid sha1sums, no duplicates). It also downloads the newest
+#   package in the manifest and verifies its sha1sum, so a swapped release
+#   asset is noticed. Fixes are pushed to main and the site is redeployed.
+#   The manifest itself is never changed automatically.
+# - codeql: CodeQL scans the GitHub workflows (the site has no JavaScript).
+#   Findings appear under Security > Code scanning.
+#
+# If anything is left that could not be fixed automatically, the run fails,
+# so GitHub sends a notification. Findings only appear in the run summary
+# and the Security tab, never in a public issue.
+
+on:
+  schedule:
+    # Every day at 04:37 UTC
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.html"
+      - "MetallibSupportPkg/**"
+      - ".github/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan
+  cancel-in-progress: false
+
+jobs:
+  site:
+    name: Site and manifest
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'albert-mueller'
+    permissions:
+      contents: write  # push fixes to main
+      actions: write   # start pages.yml afterwards
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Check and fix HTML pages and manifest
+        id: check
+        run: |
+          set +e
+          python3 .github/scripts/site_security.py --apply > "$RUNNER_TEMP/report.md"
+          rc=$?
+          set -e
+          [ "$rc" -le 2 ] || exit "$rc"
+          { echo "## Site and manifest"; cat "$RUNNER_TEMP/report.md"; } >> "$GITHUB_STEP_SUMMARY"
+          echo "remaining=$([ "$rc" -eq 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the newest package against its sha1sum
+        id: sha
+        run: |
+          read -r url sum build < <(jq -r 'max_by(.date) | "\(.url) \(.sha1sum) \(.build)"' MetallibSupportPkg/manifest.json)
+          case "$url" in
+            https://github.com/*) ;;
+            *) echo "::error::Unexpected download URL for $build"; echo "ok=false" >> "$GITHUB_OUTPUT"; exit 0 ;;
+          esac
+          if ! curl -fsSL --retry 3 --proto '=https' --tlsv1.2 -o "$RUNNER_TEMP/pkg" "$url"; then
+            echo "::warning::Could not download $build, skipping the checksum check"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          actual=$(sha1sum "$RUNNER_TEMP/pkg" | cut -d' ' -f1)
+          if [ "$actual" = "$sum" ]; then
+            echo "- sha1sum of the newest package ($build) matches the manifest" >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "- **sha1sum of $build does not match the manifest** (expected $sum, got $actual). Check the release asset before anyone downloads it." >> "$GITHUB_STEP_SUMMARY"
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push fixes to main
+        id: push
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- '*.html'; then
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          { echo '```diff'; git diff -- '*.html'; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898283+github-actions[bot]@users.noreply.github.com"
+          git add -- '*.html'
+          git commit -m "fix(security): harden Metallibs API pages"
+          git pull --rebase "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" main
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" HEAD:main
+          echo "pushed=true" >> "$GITHUB_OUTPUT"
+
+      # Pushes made with the job token don't trigger other workflows, so the
+      # deploy is started explicitly (workflow_dispatch is allowed).
+      - name: Redeploy the site
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run pages.yml --ref main
+
+      - name: Fail if problems remain
+        if: steps.check.outputs.remaining == 'true' || steps.sha.outputs.ok == 'false'
+        run: |
+          echo "::error::Some problems could not be fixed automatically, see the run summary."
+          exit 1
+
+  codeql:
+    name: CodeQL (actions)
+    runs-on: ubuntu-latest
+    if: github.repository_owner == 'albert-mueller'
+    permissions:
+      contents: read
+      security-events: write  # upload the results to the Security tab
+      actions: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: actions
+          build-mode: none
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: "/language:actions"
+
+  code-alerts:
+    name: Open code scanning alerts
+    runs-on: ubuntu-latest
+    needs: codeql
+    if: always() && github.repository_owner == 'albert-mueller'
+    permissions:
+      security-events: read
+    steps:
+      - name: List open alerts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Results can take a moment to be processed after the upload
+          sleep 60
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/code-scanning/alerts?state=open&per_page=100" \
+            --jq '.[] | [(.rule.security_severity_level // .rule.severity // "unknown"), .rule.id, .most_recent_instance.location.path, (.most_recent_instance.location.start_line|tostring), .html_url] | @tsv' \
+            > alerts.tsv || { echo "::warning::Could not read code scanning alerts"; exit 0; }
+
+          if [ ! -s alerts.tsv ]; then
+            echo "## Code scanning: no open alerts" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          {
+            echo "## Code scanning: open alerts"
+            echo "Open an alert and click **Generate fix** for a suggested patch."
+            echo
+            echo "| Severity | Rule | Location | Alert |"
+            echo "|---|---|---|---|"
+            awk -F'\t' '{ printf "| %s | `%s` | `%s:%s` | [open](%s) |\n", $1, $2, $3, $4, $5 }' alerts.tsv
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if cut -f1 alerts.tsv | grep -qE '^(critical|high|error)$'; then
+            echo "::error::There are open high/critical code scanning alerts, see the run summary."
+            exit 1
+          fi
