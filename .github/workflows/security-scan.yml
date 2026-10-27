@@ -10,8 +10,11 @@ name: CI - Security Scan
 #   package in the manifest and verifies its sha1sum, so a swapped release
 #   asset is noticed. Fixes are pushed to main and the site is redeployed.
 #   The manifest itself is never changed automatically.
-# - codeql: CodeQL scans the GitHub workflows (the site has no JavaScript).
-#   Findings appear under Security > Code scanning.
+# - code-alerts: CodeQL itself runs through GitHub's default setup
+#   (Settings > Code security > CodeQL analysis), which scans every push to
+#   main and runs weekly. A second CodeQL setup in a workflow is rejected by
+#   GitHub while default setup is on, so this job only reads its open
+#   alerts every day. Findings appear under Security > Code scanning.
 #
 # If anything is left that could not be fixed automatically, the run fails,
 # so GitHub sends a notification. Findings only appear in the run summary
@@ -117,37 +120,11 @@ jobs:
           echo "::error::Some problems could not be fixed automatically, see the run summary."
           exit 1
 
-  codeql:
-    name: CodeQL (actions)
-    runs-on: ubuntu-latest
-    if: github.repository_owner == 'albert-mueller'
-    permissions:
-      contents: read
-      security-events: write  # upload the results to the Security tab
-      actions: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-        with:
-          persist-credentials: false
-
-      - name: Initialize CodeQL
-        uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
-        with:
-          languages: actions
-          build-mode: none
-          queries: security-extended
-
-      - name: Analyze
-        uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
-        with:
-          category: "/language:actions"
 
   code-alerts:
     name: Open code scanning alerts
     runs-on: ubuntu-latest
-    needs: codeql
-    if: always() && github.repository_owner == 'albert-mueller'
+    if: github.repository_owner == 'albert-mueller'
     permissions:
       security-events: read
     steps:
@@ -155,8 +132,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          # Results can take a moment to be processed after the upload
-          sleep 60
           gh api --paginate "repos/${GITHUB_REPOSITORY}/code-scanning/alerts?state=open&per_page=100" \
             --jq '.[] | [(.rule.security_severity_level // .rule.severity // "unknown"), .rule.id, .most_recent_instance.location.path, (.most_recent_instance.location.start_line|tostring), .html_url] | @tsv' \
             > alerts.tsv || { echo "::warning::Could not read code scanning alerts"; exit 0; }
